@@ -1,367 +1,271 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import joblib
+import glob
+import os
 import time
 import threading
-from gtts import gTTS
-import os
-import tempfile
+from collections import deque
 from PIL import Image, ImageDraw, ImageFont
-import math
 
-class HandWashingGuide:
+STEP_SECONDS = 10         # 단계별 목표 10초 (표시/음성/실제 측정 모두 동일)
+TOTAL_STEPS = 6
+TOTAL_SECONDS = STEP_SECONDS * TOTAL_STEPS  # 60초
+
+# MediaPipe 특징 추출 (기존 main.py와 동일 형태) 
+def extract_hand_features(landmarks):
+    features = []
+    for lm in landmarks:
+        features.extend([lm.x, lm.y, lm.z])
+    finger_tips = [8, 12, 16, 20]
+    for tip in finger_tips:
+        features.extend([landmarks[tip].x, landmarks[tip].y, landmarks[tip].z])
+    finger_mids = [6, 10, 14, 18]
+    for mid in finger_mids:
+        features.extend([landmarks[mid].x, landmarks[mid].y, landmarks[mid].z])
+    thumb_tip = landmarks[4]; thumb_ip = landmarks[3]
+    features.extend([thumb_tip.x, thumb_tip.y, thumb_tip.z])
+    features.extend([thumb_ip.x, thumb_ip.y, thumb_ip.z])
+    wrist = landmarks[0]
+    features.extend([wrist.x, wrist.y, wrist.z])
+    return features
+
+class HandWashingGuideML:
     def __init__(self):
-        # MediaPipe 초기화
+        # 1) MediaPipe
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
         self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
+            static_image_mode=False, max_num_hands=1,
+            min_detection_confidence=0.7, min_tracking_confidence=0.5
         )
-        
-        # 손 씻기 단계 정의
-        self.washing_steps = [
-            "손바닥 비비기",
-            "손등 비비기", 
-            "손가락 사이 비비기",
-            "손가락 끝 비비기",
-            "엄지손가락 비비기",
-            "손목 비비기"
+
+        # 2) 모델 자동 로드 (trained_models/*.joblib 중 최신)
+        model_files = glob.glob('trained_models/*.joblib')
+        if model_files:
+            latest = max(model_files, key=os.path.getctime)
+            self.model = joblib.load(latest)
+            print(f"[INFO] Loaded model: {latest}")
+        else:
+            self.model = None
+            print("[WARN] No trained model found. Please train and put a .joblib into trained_models/")
+
+        # 3) 단계 정의 (라벨 키 ↔ 한글명 ↔ 안내문)
+        self.step_keys = [
+            'palm_rubbing', 'back_rubbing', 'finger_gaps',
+            'finger_tips', 'thumb_rubbing', 'wrist_rubbing'
         ]
-        
-        # 상태 변수
+        self.step_names = {
+            'palm_rubbing': '손바닥 비비기',
+            'back_rubbing': '손등 비비기',
+            'finger_gaps': '손가락 사이 비비기',
+            'finger_tips': '손가락 끝 비비기',
+            'thumb_rubbing': '엄지손가락 비비기',
+            'wrist_rubbing': '손목 비비기'
+        }
         self.current_step = 0
-        self.step_start_time = 0
-        self.total_start_time = 0
-        self.is_washing = False
-        self.step_completed = False
-        self.washing_completed = False  # 전체 완료 상태 추가
-        self.step_duration = 10  # 각 단계별 권장 시간 (초)
-        self.total_duration = 60  # 전체 권장 시간 (초)
-        
-        # 동작 인식 변수
-        self.prev_hand_landmarks = None
-        self.movement_threshold = 0.05
-        self.movement_counter = 0
-        self.movement_threshold_count = 10
-        self.current_gesture = None  # 현재 감지된 동작
-        
-        # 음성 파일 경로
-        self.audio_files = {}
-        self.create_audio_files()
-        
-    def create_audio_files(self):
-        """음성 안내 파일들을 생성합니다."""
-        print("음성 파일을 생성하는 중...")
-        
-        # 임시 디렉토리 생성
-        if not os.path.exists("temp_audio"):
-            os.makedirs("temp_audio")
-        
-        # 각 단계별 음성 파일 생성
-        for i, step in enumerate(self.washing_steps):
+        self.step_active_time = 0.0      # 현재 단계에서 "맞게 수행한" 누적 시간(초)
+        self.total_active_time = 0.0     # 전체에서 "맞게 수행한" 누적 시간(초)
+        self.running = False
+        self.last_time = None
+
+        # 4) 예측 안정화(스무딩)
+        self.pred_hist = deque(maxlen=8)   # 최근 8프레임
+        self.need_majority = 5             # 그중 >=5 프레임이 현재 단계 라벨이면 "맞게 수행 중"으로 인정
+        self.proba_thresh = 0.35           # predict_proba 있으면 사용 (없으면 무시)
+
+        # 5) 오디오(10초 문구로 통일)
+        self.audio = {}
+        self._prepare_audio()
+
+    def _prepare_audio(self):
+        try:
+            from gtts import gTTS
+            os.makedirs("temp_audio", exist_ok=True)
+            for i, key in enumerate(self.step_keys):
+                text = f"{self.step_names[key]}를 시작합니다. 10초간 계속해주세요."
+                path = f"temp_audio/step_{i}.mp3"
+                if not os.path.exists(path):
+                    gTTS(text=text, lang='ko').save(path)
+                self.audio[i] = path
+            done_path = "temp_audio/complete.mp3"
+            if not os.path.exists(done_path):
+                gTTS(text="손 씻기가 완료되었습니다! 잘 하셨습니다.", lang='ko').save(done_path)
+            self.audio['complete'] = done_path
+        except Exception as e:
+            print(f"[WARN] TTS 생성 실패: {e} (인터넷 연결 또는 gTTS 확인)")
+
+    def _play_audio_async(self, path):
+        if not path or not os.path.exists(path):
+            return
+        def _player():
             try:
-                tts = gTTS(text=f"{step}를 시작합니다. 5초간 계속해주세요.", lang='ko')
-                audio_path = f"temp_audio/step_{i}.mp3"
-                tts.save(audio_path)
-                self.audio_files[i] = audio_path
+                # OS 기본 플레이어로 열기 (간단)
+                import platform, subprocess
+                if platform.system() == "Windows":
+                    os.startfile(os.path.abspath(path))
+                elif platform.system() == "Darwin":
+                    subprocess.call(["open", path])
+                else:
+                    subprocess.call(["xdg-open", path])
             except Exception as e:
-                print(f"음성 파일 생성 실패: {e}")
-        
-        # 완료 메시지
+                print(f"[WARN] 오디오 재생 실패: {e}")
+        threading.Thread(target=_player, daemon=True).start()
+
+    def _predict_label(self, landmarks):
+        if self.model is None or landmarks is None:
+            return None, None
+        feats = extract_hand_features(landmarks)
+        label = None
+        proba = None
         try:
-            tts = gTTS(text="손 씻기가 완료되었습니다! 잘 하셨습니다.", lang='ko')
-            audio_path = "temp_audio/complete.mp3"
-            tts.save(audio_path)
-            self.audio_files['complete'] = audio_path
+            # RandomForest 등은 predict_proba 지원
+            label = self.model.predict([feats])[0]
+            if hasattr(self.model, "predict_proba"):
+                probs = self.model.predict_proba([feats])[0]
+                # 클래스 인덱스 찾기
+                try:
+                    classes = list(self.model.classes_)
+                    if label in classes:
+                        proba = float(probs[classes.index(label)])
+                except Exception:
+                    proba = None
         except Exception as e:
-            print(f"완료 음성 파일 생성 실패: {e}")
-    
-    def calculate_hand_movement(self, landmarks):
-        """손의 움직임을 계산합니다."""
-        if self.prev_hand_landmarks is None:
-            self.prev_hand_landmarks = landmarks
-            return 0
-        
-        # 손목(0번 랜드마크)의 움직임 계산
-        wrist_movement = np.linalg.norm(
-            np.array([landmarks[0].x, landmarks[0].y]) - 
-            np.array([self.prev_hand_landmarks[0].x, self.prev_hand_landmarks[0].y])
-        )
-        
-        self.prev_hand_landmarks = landmarks
-        return wrist_movement
-    
-    def detect_washing_motion(self, landmarks):
-        """손 씻기 동작을 감지합니다."""
-        if landmarks is None:
+            print(f"[WARN] 예측 실패: {e}")
+        return label, proba
+
+    def _matched_current_step(self, label, proba):
+        """현재 단계와 라벨 일치 + (있다면) 확률 임계 통과 + 히스토리 과반수"""
+        if label is None:
+            self.pred_hist.append("_")
             return False
-        
-        movement = self.calculate_hand_movement(landmarks)
-        
-        if movement > self.movement_threshold:
-            self.movement_counter += 1
-        else:
-            self.movement_counter = max(0, self.movement_counter - 1)
-        
-        # 충분한 움직임이 감지되면 손 씻기 동작으로 판단
-        return self.movement_counter >= self.movement_threshold_count
-    
-    def detect_specific_hand_gesture(self, landmarks):
-        """특정 손 씻기 동작을 감지합니다."""
-        if landmarks is None:
-            return None
-        
-        # 손가락 끝점들의 좌표 추출
-        finger_tips = [8, 12, 16, 20]  # 검지, 중지, 약지, 새끼 손가락 끝
-        finger_mids = [6, 10, 14, 18]  # 손가락 중간 관절
-        
-        # 손바닥 비비기 감지 (손가락들이 구부러져 있고 손이 좌우로 움직임)
-        fingers_bent = 0
-        for tip, mid in zip(finger_tips, finger_mids):
-            if landmarks[tip].y > landmarks[mid].y:
-                fingers_bent += 1
-        
-        # 손등 비비기 감지 (손가락들이 펴져 있고 손이 좌우로 움직임)
-        fingers_straight = 0
-        for tip, mid in zip(finger_tips, finger_mids):
-            if landmarks[tip].y < landmarks[mid].y:
-                fingers_straight += 1
-        
-        # 엄지손가락 비비기 감지 (엄지가 다른 손가락과 마찰하는 동작)
-        thumb_tip = landmarks[4]
-        index_tip = landmarks[8]
-        thumb_index_distance = np.linalg.norm(
-            np.array([thumb_tip.x, thumb_tip.y]) - 
-            np.array([index_tip.x, index_tip.y])
-        )
-        
-        # 동작 판단
-        if fingers_bent >= 3 and self.movement_counter >= 5:
-            return "palm_rubbing"  # 손바닥 비비기
-        elif fingers_straight >= 3 and self.movement_counter >= 5:
-            return "back_rubbing"  # 손등 비비기
-        elif thumb_index_distance < 0.1 and self.movement_counter >= 3:
-            return "thumb_rubbing"  # 엄지손가락 비비기
-        else:
-            return "general_movement"  # 일반적인 움직임
-    
-    def draw_ui(self, frame, elapsed_time, step_time):
-        """UI를 그립니다."""
-        height, width = frame.shape[:2]
-        
-        # 배경 오버레이
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (width, 160), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-        
-        # 제목 (영어로 표시하여 깨짐 방지)
-        cv2.putText(frame, "Hand Washing Guide System", (20, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        # 현재 단계
-        if self.is_washing:
-            # 단계별 영어 표시
-            step_names = ["Palm Rubbing", "Back Rubbing", "Finger Gaps", "Finger Tips", "Thumb Rubbing", "Wrist Rubbing"]
-            current_step_text = f"Step {self.current_step + 1}: {step_names[self.current_step]}"
-            cv2.putText(frame, current_step_text, (20, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
-            # 진행률 표시
-            progress = min(1.0, step_time / self.step_duration)
-            bar_width = int(300 * progress)
-            cv2.rectangle(frame, (20, 80), (320, 90), (100, 100, 100), -1)
-            cv2.rectangle(frame, (20, 80), (20 + bar_width, 90), (0, 255, 0), -1)
-            
-            # 시간 표시
-            time_text = f"Time: {step_time:.1f}s / {self.step_duration}s"
-            cv2.putText(frame, time_text, (330, 90), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            
-            # 전체 시간
-            total_time_text = f"Total: {elapsed_time:.1f}s / {self.total_duration}s"
-            cv2.putText(frame, total_time_text, (20, 120), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-            
-            # 전체 진행률
-            total_progress = min(1.0, elapsed_time / self.total_duration)
-            total_bar_width = int(400 * total_progress)
-            cv2.rectangle(frame, (20, 140), (420, 150), (100, 100, 100), -1)
-            cv2.rectangle(frame, (20, 140), (20 + total_bar_width, 150), (0, 255, 255), -1)
-            
-            # 완료 상태 표시
-            if self.step_completed:
-                cv2.putText(frame, "Step Complete! Press 'n' for next", (20, 170), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-        else:
-            cv2.putText(frame, "Move your hands to start", (20, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, "Or press 's' to start manually", (20, 90), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
-    def play_audio(self, audio_path):
-        """음성을 재생합니다."""
+        need_key = self.step_keys[self.current_step]
+        ok_label = (label == need_key)
+        ok_proba = (proba is None) or (proba >= self.proba_thresh)
+        self.pred_hist.append(label if ok_label and ok_proba else "_")
+        # 최근 히스토리 중 현재 단계 라벨 개수
+        cnt = sum(1 for x in self.pred_hist if x == need_key)
+        return cnt >= self.need_majority
+
+    def start(self):
+        self.running = True
+        self.current_step = 0
+        self.step_active_time = 0.0
+        self.total_active_time = 0.0
+        self.last_time = time.time()
+        if 0 in self.audio:
+            self._play_audio_async(self.audio[0])
+
+    def _advance_step(self):
+        self.current_step += 1
+        self.step_active_time = 0.0
+        self.pred_hist.clear()
+        if self.current_step < TOTAL_STEPS and self.current_step in self.audio:
+            self._play_audio_async(self.audio[self.current_step])
+
+    def _draw_ui(self, frame, matched):
+        pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil)
         try:
-            # 간단한 방법으로 음성 파일 실행
-            import platform
-            if platform.system() == "Windows":
-                os.system(f'start "" "{os.path.abspath(audio_path)}"')
-            else:
-                os.system(f'xdg-open "{audio_path}"')
-        except Exception as e:
-            print(f"음성 재생 실패: {e}")
-            print("음성 안내 대신 텍스트로 표시됩니다.")
-    
-    def start_step(self, step_index):
-        """새로운 단계를 시작합니다."""
-        self.current_step = step_index
-        self.step_start_time = time.time()
-        self.step_completed = False
-        self.movement_counter = 0
-        
-        # 음성 안내 재생
-        if step_index in self.audio_files:
-            threading.Thread(target=self.play_audio, args=(self.audio_files[step_index],)).start()
-    
-    def auto_next_step(self):
-        """자동으로 다음 단계로 진행합니다."""
-        if self.current_step < len(self.washing_steps) - 1:
-            self.start_step(self.current_step + 1)
-            print(f"Auto-progressed to step {self.current_step + 1}")
-    
+            font_title = ImageFont.truetype("C:/Windows/Fonts/malgun.ttf", 32)
+            font_body  = ImageFont.truetype("C:/Windows/Fonts/malgun.ttf", 24)
+        except:
+            font_title = ImageFont.load_default(); font_body = ImageFont.load_default()
+
+        # 헤더
+        draw.text((20, 20), "손 씻기 가이드 (ML)", font=font_title, fill=(255,255,255,255))
+
+        # 현재 단계
+        step_txt = f"현재 단계: {self.step_names[self.step_keys[self.current_step]] if self.current_step<TOTAL_STEPS else '완료'}"
+        draw.text((20, 60), step_txt, font=font_body, fill=(0,255,255,255))
+
+        # 일치 여부 배지
+        badge = "동작 일치" if matched else "동작 불일치"
+        badge_color = (0, 255, 0, 255) if matched else (255, 80, 80, 255)
+        draw.text((20, 90), badge, font=font_body, fill=badge_color)
+
+        # 단계 진행바
+        step_progress = 1.0 if self.current_step >= TOTAL_STEPS else min(1.0, self.step_active_time / STEP_SECONDS)
+        x0, y0, w, h = 20, 130, 400, 18
+        draw.rectangle([x0, y0, x0+w, y0+h], fill=(60,60,60,200))
+        draw.rectangle([x0, y0, x0+int(w*step_progress), y0+h], fill=(0,200,0,255))
+        draw.text((x0+w+10, y0-2), f"{self.step_active_time:4.1f}s / {STEP_SECONDS}s", font=font_body, fill=(255,255,255,255))
+
+        # 전체 진행바(맞게 수행한 시간 합산)
+        total_progress = min(1.0, self.total_active_time / TOTAL_SECONDS)
+        X0, Y0, W, H = 20, 160, 500, 18
+        draw.rectangle([X0, Y0, X0+W, Y0+H], fill=(60,60,60,200))
+        draw.rectangle([X0, Y0, X0+int(W*total_progress), Y0+H], fill=(0,255,255,255))
+        draw.text((X0+W+10, Y0-2), f"{self.total_active_time:4.1f}s / {TOTAL_SECONDS}s", font=font_body, fill=(255,255,255,255))
+
+        # 적용
+        frame[:,:,:] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
     def run(self):
-        """메인 실행 루프"""
         cap = cv2.VideoCapture(0)
-        
         if not cap.isOpened():
             print("웹캠을 열 수 없습니다.")
             return
-        
-        print("Hand Washing Guide System Started")
-        print("Controls:")
-        print("- Move hands to start automatically")
-        print("- Press 's' to start manually")
-        print("- Press 'n' to go to next step")
-        print("- Press 'r' to reset")
-        print("- Press 'q' to quit")
-        
+
+        print("ML 손 씻기 가이드 시작 (q: 종료, s: 시작/리셋)")
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            # 키보드 입력 처리
+
+            # 키 입력
             key = cv2.waitKey(1) & 0xFF
-            
             if key == ord('q'):
                 break
-            elif key == ord('s') and not self.is_washing and not self.washing_completed:
-                # 수동 시작
-                self.is_washing = True
-                self.washing_completed = False
-                self.total_start_time = time.time()
-                self.start_step(0)
-                print("Hand washing started manually!")
-            elif key == ord('n') and self.is_washing and self.step_completed:
-                # 다음 단계로 수동 진행
-                if self.current_step < len(self.washing_steps) - 1:
-                    self.start_step(self.current_step + 1)
+            elif key == ord('s'):
+                self.start()
+
+            # 인식/진행
+            matched = False
+            if self.running and self.current_step < TOTAL_STEPS and self.model is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = self.hands.process(rgb)
+                if results.multi_hand_landmarks:
+                    hand = results.multi_hand_landmarks[0]
+                    self.mp_drawing.draw_landmarks(frame, hand, self.mp_hands.HAND_CONNECTIONS)
+                    label, proba = self._predict_label(hand.landmark)
+                    matched = self._matched_current_step(label, proba)
                 else:
-                    # 모든 단계 완료
-                    self.washing_completed = True
-                    self.is_washing = False
-                    print("Hand washing completed!")
-                    if 'complete' in self.audio_files:
-                        threading.Thread(target=self.play_audio, args=(self.audio_files['complete'],)).start()
-            elif key == ord('r'):
-                # 리셋
-                self.is_washing = False
-                self.washing_completed = False
-                self.current_step = 0
-                self.step_completed = False
-                self.movement_counter = 0
-                print("System reset!")
-            
-            # BGR을 RGB로 변환
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.hands.process(rgb_frame)
-            
-            # 손 랜드마크 그리기
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    self.mp_drawing.draw_landmarks(
-                        frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
-                    )
-                    
-                    # 손 씻기 동작 감지
-                    landmarks = hand_landmarks.landmark
-                    is_washing = self.detect_washing_motion(landmarks)
-                    self.current_gesture = self.detect_specific_hand_gesture(landmarks)
-                    
-                    if is_washing and not self.is_washing and not self.washing_completed:
-                        # 손 씻기 시작
-                        self.is_washing = True
-                        self.washing_completed = False
-                        self.total_start_time = time.time()
-                        self.start_step(0)
-                        print("Hand washing started automatically!")
-                    
-                    elif self.is_washing and not self.washing_completed:
-                        # 현재 시간 계산
-                        current_time = time.time()
-                        elapsed_time = current_time - self.total_start_time
-                        step_time = current_time - self.step_start_time
-                        
-                        # 단계 완료 확인
-                        if step_time >= self.step_duration and not self.step_completed:
-                            self.step_completed = True
-                            print(f"Step {self.current_step + 1} completed: {self.washing_steps[self.current_step]}")
-                            
-                            # 자동으로 다음 단계로 진행 (5초 후)
-                            if self.current_step < len(self.washing_steps) - 1:
-                                threading.Timer(5.0, self.auto_next_step).start()
-                            else:
-                                # 모든 단계 완료
-                                self.washing_completed = True
-                                self.is_washing = False
-                                print("Hand washing completed!")
-                                if 'complete' in self.audio_files:
-                                    threading.Thread(target=self.play_audio, args=(self.audio_files['complete'],)).start()
-                        
-                        # UI 업데이트
-                        self.draw_ui(frame, elapsed_time, step_time)
-            
-            else:
-                # 손이 감지되지 않을 때
-                if self.is_washing and not self.washing_completed:
-                    current_time = time.time()
-                    elapsed_time = current_time - self.total_start_time
-                    step_time = current_time - self.step_start_time
-                    self.draw_ui(frame, elapsed_time, step_time)
-                else:
-                    self.draw_ui(frame, 0, 0)
-            
-            # 완료 상태 표시
-            if self.washing_completed:
-                cv2.putText(frame, "Hand Washing Completed! Press 'r' to restart", (20, 200), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
-            # 화면 표시
-            cv2.imshow('Hand Washing Guide System', frame)
-        
+                    self.pred_hist.append("_")
+
+                # 시간 누적은 "matched일 때만"
+                now = time.time()
+                dt = max(0.0, now - (self.last_time or now))
+                self.last_time = now
+
+                if matched:
+                    self.step_active_time += dt
+                    self.total_active_time += dt
+
+                # 단계 완료 판정 (딱 10초 기준)
+                if self.step_active_time >= STEP_SECONDS - 1e-6:
+                    self._advance_step()
+                    if self.current_step >= TOTAL_STEPS:
+                        # 전체 완료
+                        if 'complete' in self.audio:
+                            self._play_audio_async(self.audio['complete'])
+                        self.running = False  # 자동 정지
+
+            # UI
+            self._draw_ui(frame, matched)
+            cv2.imshow('손 씻기 가이드 (ML)', frame)
+
         cap.release()
         cv2.destroyAllWindows()
-        
-        # 임시 파일 정리
+
+        # 임시 오디오 정리 (선택)
         try:
             import shutil
             if os.path.exists("temp_audio"):
                 shutil.rmtree("temp_audio")
         except Exception as e:
-            print(f"임시 파일 정리 실패: {e}")
+            print(f"[WARN] 임시 파일 정리 실패: {e}")
 
 if __name__ == "__main__":
-    guide = HandWashingGuide()
-    guide.run()
+    HandWashingGuideML().run()
